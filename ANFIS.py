@@ -9,270 +9,290 @@ from sklearn.metrics import r2_score, mean_squared_error
 import random
 import os
 
-# =============================================================================
-# SECCIÓN 1: LECTURA Y PREPROCESAMIENTO DE DATOS
+# ----  CONFIGURACIÓN INICIAL-----
 
-print("--- [1/6] Cargando y Procesando Datos ---")
 
-filename = "AirQualityIBEROCDMX.csv"
-if not os.path.exists(filename):
-    print(f"ERROR: Archivo '{filename}' no encontrado.")
+CARPETA_SALIDA = "Resultados_Modelo_ANFIS_Optimizado"
+if not os.path.exists(CARPETA_SALIDA):
+    os.makedirs(CARPETA_SALIDA)
+
+#INGENIERÍA DE DATOS Y VARIABLES FÍSICAS (DELTAS) --- Descripción: Carga, limpia, calcula velocidad de cambio y normaliza.
+
+
+print("--- [1/6] Procesando Datos y Calculando Física ---")
+
+archivo = "AirQualityIBEROCDMX.csv"
+if not os.path.exists(archivo):
+    print("ERROR CRÍTICO: Archivo CSV no encontrado.")
     exit()
 
-df = pd.read_csv(filename)
-features = ['PM10[ug/m3]', 'Ozone [ppb]', 'Carbon_Monoxide [ppb]', 'Temperature [°C]', 'Relative_Humidity [%]']
-target = 'PM2.5 [ug/m3]'
+datos = pd.read_csv(archivo)
+col_obj = 'PM2.5 [ug/m3]'
 
-# --- LIMPIEZA ---
-df = df.dropna()
-df = df[df[target] < 600]        # Eliminar errores extremos
-df = df[df['PM10[ug/m3]'] < 1000]
+# --- LIMPIEZA DE ERRORES ---
+datos = datos.dropna()
+datos = datos[datos[col_obj] < 600]
+datos = datos[datos['PM10[ug/m3]'] < 1000]
 
-X = df[features]
-y = df[target]
+# --- CREACIÓN DE VARIABLES ---
+datos['pm25_act'] = datos[col_obj]
+datos['pm25_ant'] = datos[col_obj].shift(1)
+datos['pm25_prom'] = datos[col_obj].rolling(3).mean() # Suavizado
+
+# VELOCIDAD DE CAMBIO 
+datos['cambio_pm25'] = datos['pm25_act'] - datos['pm25_ant']
+datos['cambio_pm10'] = datos['PM10[ug/m3]'] - datos['PM10[ug/m3]'].shift(1)
+
+# OBJETIVO (Futuro t+1)
+datos['objetivo'] = datos[col_obj].shift(-1)
+
+cols_entr = [
+    'PM10[ug/m3]', 'Ozone [ppb]', 'Carbon_Monoxide [ppb]', 
+    'Temperature [°C]', 'Relative_Humidity [%]',
+    'pm25_act', 'pm25_prom', 'cambio_pm25', 'cambio_pm10'
+]
+
+datos = datos.dropna()
+
+X = datos[cols_entr]
+y = datos['objetivo']
 
 # --- NORMALIZACIÓN ---
-scaler_X = MinMaxScaler()
-scaler_y = MinMaxScaler()
-X_normalized = scaler_X.fit_transform(X)
-y_normalized = scaler_y.fit_transform(y.values.reshape(-1, 1))
+esc_X = MinMaxScaler()
+esc_y = MinMaxScaler()
 
-# --- SPLIT ---
-X_train, X_test, y_train, y_test = train_test_split(X_normalized, y_normalized, test_size=0.2, random_state=42)
+X_norm = esc_X.fit_transform(X)
+y_norm = esc_y.fit_transform(y.values.reshape(-1, 1))
+
+# División: 80% Entrenamiento, 20% Prueba
+X_ent, X_pru, y_ent, y_pru = train_test_split(X_norm, y_norm, test_size=0.2, random_state=42)
 
 # Tensores
-X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+X_ent_t = torch.tensor(X_ent, dtype=torch.float32)
+y_ent_t = torch.tensor(y_ent, dtype=torch.float32)
+X_pru_t = torch.tensor(X_pru, dtype=torch.float32)
+y_pru_t = torch.tensor(y_pru, dtype=torch.float32)
 
 print("Datos listos.")
 
-# =============================================================================
-#  ARQUITECTURA ANFIS
+#  ARQUITECTURA ANFIS (RED NEURO-DIFUSA)  Define la estructura híbrida (Gaussianas + Red Neuronal).
 
 
-class ANFIS_Global(nn.Module):
-    def __init__(self, num_inputs, num_mf, num_rules):
-        super(ANFIS_Global, self).__init__()
-        self.num_inputs = num_inputs
-        self.num_mf = num_mf
-        
-        self.means = nn.Parameter(torch.rand(num_inputs, num_mf))
-        self.sigmas = nn.Parameter(torch.ones(num_inputs, num_mf))
-        self.rule_connection = nn.Linear(num_inputs * num_mf, num_rules)
-        self.consequence = nn.Linear(num_rules, 1)
-        
-        nn.init.xavier_uniform_(self.consequence.weight)
-        nn.init.zeros_(self.consequence.bias)
+class ANFIS(nn.Module):
+    def __init__(self, n_entr, n_curvas, n_reglas):
+        super(ANFIS, self).__init__()
+        self.n_entr = n_entr
+        self.n_curvas = n_curvas
+        self.medias = nn.Parameter(torch.rand(n_entr, n_curvas))
+        self.sigmas = nn.Parameter(torch.ones(n_entr, n_curvas))
+        self.capa_reglas = nn.Linear(n_entr * n_curvas, n_reglas)
+        self.salida = nn.Linear(n_reglas, 1)
+        nn.init.xavier_uniform_(self.salida.weight)
+        nn.init.zeros_(self.salida.bias)
 
     def forward(self, x):
-        # Fuzzificación
-        x_unsqueeze = x.unsqueeze(-1)
-        pertenencia = torch.exp(-torch.pow(x_unsqueeze - self.means, 2) / (2 * torch.pow(self.sigmas, 2)))
-        
-        # Reglas
-        batch_size = x.shape[0]
-        x_flat = pertenencia.reshape(batch_size, -1)
-        rules_output = torch.relu(self.rule_connection(x_flat))
-        
-        # Defuzzificación
-        prediction = self.consequence(rules_output)
-        return prediction
+        x_exp = x.unsqueeze(-1)
+        pertenencia = torch.exp(-torch.pow(x_exp - self.medias, 2) / (2 * torch.pow(self.sigmas, 2)))
+        lote = x.shape[0]
+        x_plano = pertenencia.reshape(lote, -1)
+        reglas_out = torch.relu(self.capa_reglas(x_plano))
+        return self.salida(reglas_out)
 
-    def inicializar_parametros(self, X_data):
+    def inic_params(self, datos_X):
         with torch.no_grad():
-            for i in range(self.num_inputs):
-                columna = X_data[:, i]
-                self.means[i] = torch.quantile(columna, torch.linspace(0.1, 0.9, self.num_mf))
-                self.sigmas[i] = torch.std(columna) + 0.05
+            for i in range(self.n_entr):
+                col = datos_X[:, i]
+                self.medias[i] = torch.quantile(col, torch.linspace(0.1, 0.9, self.n_curvas))
+                self.sigmas[i] = torch.std(col) + 0.05
 
-# =============================================================================
-# ALGORITMO GENÉTICO
+#  ALGORITMO GENÉTICO (OPTIMIZACIÓN DE ARQUITECTURA)- Busca la mejor cantidad de reglas y tasa de aprendizaje.
 
-print("\n--- [2/6] Optimizando Hiperparámetros (Genético) ---")
 
-def evaluar_cromosoma(num_rules, lr):
-    model = ANFIS_Global(num_inputs=5, num_mf=3, num_rules=int(num_rules))
-    model.inicializar_parametros(X_train_tensor)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    model.train()
+print("\n--- [2/6] Ejecutando Algoritmo Genético ---")
+
+def evaluar(n_reglas, tasa):
+    modelo = ANFIS(n_entr=9, n_curvas=3, n_reglas=int(n_reglas))
+    modelo.inic_params(X_ent_t)
+    criterio = nn.MSELoss()
+    optimizador = torch.optim.Adam(modelo.parameters(), lr=tasa)
+    modelo.train()
     for _ in range(30): 
-        optimizer.zero_grad()
-        y_pred = model(X_train_tensor)
-        loss = criterion(y_pred, y_train_tensor)
-        loss.backward()
-        optimizer.step()
-    
-    model.eval()
+        optimizador.zero_grad()
+        pred = modelo(X_ent_t)
+        error = criterio(pred, y_ent_t)
+        error.backward()
+        optimizador.step()
+    modelo.eval()
     with torch.no_grad():
-        test_pred = model(X_test_tensor)
-        test_loss = criterion(test_pred, y_test_tensor)
-    return test_loss.item()
+        loss_pru = criterio(modelo(X_pru_t), y_pru_t)
+    return loss_pru.item()
 
-# Población pequeña 
-poblacion = [{'rules': random.randint(10, 30), 'lr': random.uniform(0.001, 0.01)} for _ in range(5)]
-best_genes = None
-best_score = float('inf')
+poblacion = [{'reglas': random.randint(20, 50), 'tasa': random.uniform(0.001, 0.015)} for _ in range(6)]
+mejor_gen = None
+mejor_puntaje = float('inf')
 
-for gen in range(3):
-    scores = []
-    for individuo in poblacion:
-        score = evaluar_cromosoma(individuo['rules'], individuo['lr'])
-        scores.append((score, individuo))
-        if score < best_score:
-            best_score = score
-            best_genes = individuo
+for gen in range(4): 
+    puntajes = []
+    for indiv in poblacion:
+        pt = evaluar(indiv['reglas'], indiv['tasa'])
+        puntajes.append((pt, indiv))
+        if pt < mejor_puntaje:
+            mejor_puntaje = pt
+            mejor_gen = indiv
     
-    print(f"Gen {gen+1}: Mejor Error = {best_score:.5f}")
+    print(f"Gen {gen+1}: Error Mínimo = {mejor_puntaje:.5f}")
     
-    scores.sort(key=lambda x: x[0])
-    padres = [x[1] for x in scores[:2]]
-    nueva_poblacion = padres[:]
-    while len(nueva_poblacion) < 5:
+    puntajes.sort(key=lambda x: x[0])
+    padres = [x[1] for x in puntajes[:2]]
+    nueva_pob = padres[:]
+    while len(nueva_pob) < 6:
         padre = random.choice(padres)
-        hijo = {'rules': int(padre['rules'] + random.randint(-2, 2)), 'lr': padre['lr'] * random.uniform(0.9, 1.1)}
-        hijo['rules'] = max(5, min(40, hijo['rules']))
-        nueva_poblacion.append(hijo)
-    poblacion = nueva_poblacion
+        hijo = {'reglas': int(padre['reglas'] + random.randint(-3, 3)), 'tasa': padre['tasa'] * random.uniform(0.9, 1.1)}
+        hijo['reglas'] = max(15, min(60, hijo['reglas']))
+        nueva_pob.append(hijo)
+    poblacion = nueva_pob
 
-print(f"GANADOR: {best_genes['rules']} Reglas | LR: {best_genes['lr']:.5f}")
+print(f"GANADOR: {mejor_gen['reglas']} Reglas | Tasa: {mejor_gen['tasa']:.5f}")
 
-# =============================================================================
-#  ENTRENAMIENTO 
-print("\n--- [3/6] Entrenando Modelo Final ---")
+#  ENTRENAMIENTO PROFUNDO - Entrena el modelo ganador usando un Scheduler.
 
-final_rules = best_genes['rules']
-final_lr = best_genes['lr']
-EPOCHS = 1500
 
-model = ANFIS_Global(num_inputs=5, num_mf=3, num_rules=final_rules)
-model.inicializar_parametros(X_train_tensor)
-optimizer = torch.optim.Adam(model.parameters(), lr=final_lr)
-criterion = nn.MSELoss()
+print("\n--- [3/6] Iniciando Entrenamiento Final ---")
 
-loss_history = [] # Para la gráfica 1
+reglas_fin = mejor_gen['reglas']
+tasa_fin = mejor_gen['tasa']
+EPOCAS = 3000
 
-for epoch in range(EPOCHS):
-    model.train()
-    optimizer.zero_grad()
-    y_pred = model(X_train_tensor)
-    loss = criterion(y_pred, y_train_tensor)
-    loss.backward()
-    optimizer.step()
-    loss_history.append(loss.item())
+modelo = ANFIS(n_entr=9, n_curvas=3, n_reglas=reglas_fin)
+modelo.inic_params(X_ent_t)
+
+optimizador = torch.optim.Adam(modelo.parameters(), lr=tasa_fin)
+regulador = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizador, mode='min', factor=0.5, patience=100)
+criterio = nn.MSELoss()
+
+hist_error = [] 
+
+for e in range(EPOCAS):
+    modelo.train()
+    optimizador.zero_grad()
+    predic = modelo(X_ent_t)
+    error = criterio(predic, y_ent_t)
+    error.backward()
+    optimizador.step()
+    regulador.step(error)
+    hist_error.append(error.item())
     
-    if (epoch+1) % 500 == 0:
-        print(f"Epoch {epoch+1}/{EPOCHS}: Error {loss.item():.5f}")
+    if (e+1) % 500 == 0:
+        print(f"Época {e+1}: Error {error.item():.5f}")
 
-# =============================================================================
-# VISUALIZACIÓN Y REPORTES(GRÁFICAS)
+# GENERACIÓN DE  GRÁFICAS 
 
-print("\n--- [4/6] Generando Gráficas y Métricas ---")
 
-model.eval()
+print("\n--- [4/6] Generando  Gráficas en Carpeta ---")
+
+modelo.eval()
 with torch.no_grad():
-    pred_norm = model(X_test_tensor).numpy()
+    pred_norm = modelo(X_pru_t).numpy()
 
-pred_real = scaler_y.inverse_transform(pred_norm)
-y_real = scaler_y.inverse_transform(y_test)
+pred_real = esc_y.inverse_transform(pred_norm)
+y_real = esc_y.inverse_transform(y_pru)
 pred_real = np.maximum(pred_real, 0)
+residous = y_real - pred_real
 
-# --- CLASIFICACIÓN ---
-def clasificar_riesgo(valor):
-    if valor < 12: return "BAJO (Bueno)"
-    elif valor < 35.5: return "MEDIO (Moderado)"
-    elif valor < 55.5: return "ALTO (Dañino Sensible)"
-    elif valor < 150.5: return "MUY ALTO (Dañino)"
-    else: return "PELIGROSO"
-
-# --- MÉTRICAS ---
+# Métricas Numéricas
 rmse = np.sqrt(mean_squared_error(y_real, pred_real))
 r2 = r2_score(y_real, pred_real)
 mape = np.mean(np.abs((y_real - pred_real) / (y_real + 0.1))) * 100
 
-print(f"\nRMSE: {rmse:.2f} | R2: {r2:.4f} | MAPE: {mape:.2f}%")
+print(f"\n>>> MÉTRICAS FINALES <<<")
+print(f"RMSE: {rmse:.2f} | R2: {r2:.4f} | MAPE: {mape:.2f}%")
 
-# --- GENERACIÓN DE 3 GRÁFICAS ---
-plt.figure(figsize=(18, 5))
-
-# GRÁFICA 1: Curva de Aprendizaje
-plt.subplot(1, 3, 1)
-plt.plot(loss_history, color='blue', linewidth=2)
-plt.title('1. Curva de Aprendizaje (Loss)')
+# --- GRÁFICA 1: Curva de Aprendizaje ---
+plt.figure(figsize=(10, 6))
+plt.plot(hist_error, color='blue', linewidth=2)
+plt.title('1. Curva de Convergencia (MSE Loss)')
 plt.xlabel('Épocas')
-plt.ylabel('Error (MSE)')
+plt.ylabel('Error')
 plt.grid(True, alpha=0.3)
+plt.savefig(os.path.join(CARPETA_SALIDA, "1_Curva_Aprendizaje.png"), dpi=300)
+plt.close()
 
-# GRÁFICA 2: Predicción vs Realidad (Scatter)
-plt.subplot(1, 3, 2)
-scatter = plt.scatter(y_real, pred_real, c=pred_real, cmap='RdYlGn_r', alpha=0.6, s=15)
-plt.plot([0, y_real.max()], [0, y_real.max()], 'k--', lw=1.5, label='Ideal')
-plt.colorbar(scatter, label='Nivel PM2.5')
-plt.title(f'2. Precisión (R2: {r2:.2f})')
+# --- GRÁFICA 2: Comparación Lineal Completa ---
+plt.figure(figsize=(12, 6))
+plt.plot(y_real, label='Realidad', color='black', alpha=0.7, linewidth=1)
+plt.plot(pred_real, label='Predicción IA', color='orange', alpha=0.7, linewidth=1)
+plt.title(f'2. Serie de Tiempo Completa (R2={r2:.2f})')
+plt.legend()
+plt.savefig(os.path.join(CARPETA_SALIDA, "2_Serie_Completa.png"), dpi=300)
+plt.close()
+
+# --- GRÁFICA 3: Dispersión (Regresión) ---
+plt.figure(figsize=(8, 8))
+plt.scatter(y_real, pred_real, alpha=0.4, s=10, c='purple')
+plt.plot([0, y_real.max()], [0, y_real.max()], 'k--', linewidth=2)
+plt.title('3. Análisis de Regresión (Scatter)')
 plt.xlabel('Valor Real')
-plt.ylabel('Predicción IA')
+plt.ylabel('Valor Predicho')
+plt.savefig(os.path.join(CARPETA_SALIDA, "3_Dispersion_Regresion.png"), dpi=300)
+plt.close()
+
+# --- GRÁFICA 4: Histograma de Errores ---
+plt.figure(figsize=(10, 6))
+plt.hist(residous, bins=50, color='green', alpha=0.7, edgecolor='black')
+plt.title('4. Distribución de Errores (Residuos)')
+plt.xlabel('Magnitud del Error (ug/m3)')
+plt.ylabel('Frecuencia')
+plt.axvline(x=0, color='k', linestyle='--')
+plt.savefig(os.path.join(CARPETA_SALIDA, "4_Histograma_Errores.png"), dpi=300)
+plt.close()
+
+# --- GRÁFICA 5: Zoom (Detalle) ---
+plt.figure(figsize=(12, 6))
+muestras = 100 # Primeras 100 horas
+plt.plot(y_real[:muestras], label='Real', color='black', marker='o', markersize=3)
+plt.plot(pred_real[:muestras], label='Predicción', color='red', linewidth=2)
+plt.title('5. Zoom de Detalle (Primeras 100 horas)')
 plt.legend()
 plt.grid(True, alpha=0.3)
+plt.savefig(os.path.join(CARPETA_SALIDA, "5_Zoom_Detalle.png"), dpi=300)
+plt.close()
 
-# GRÁFICA 3: Zoom a Muestras (Serie de Tiempo)
-plt.subplot(1, 3, 3)
-muestras = 50 # Solo las primeras 50 para ver detalle
-plt.plot(y_real[:muestras], label='Realidad', color='blue', marker='o', markersize=4, alpha=0.7)
-plt.plot(pred_real[:muestras], label='Predicción', color='red', linestyle='--', linewidth=2)
-plt.title('3. Detalle (Zoom primeros 50 datos)')
-plt.xlabel('Muestra')
-plt.ylabel('PM2.5')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show() # Muestra todas las gráficas juntas
-
-# Guardar CSV
-df_res = pd.DataFrame({'Real': y_real.flatten(), 'Prediccion': pred_real.flatten()})
-df_res['Riesgo'] = df_res['Prediccion'].apply(clasificar_riesgo)
-df_res.to_csv('resultados.csv', index=False)
-print("Archivo 'resultados.csv' guardado.")
-
-# INGRESO DE DATOS 1 VEZ=============================================================================
+#  (PRONÓSTICO MANUAL)
 
 
 print("\n" + "="*50)
-print("   SISTEMA DE PREDICCIÓN - CONSULTA ")
+print("   SISTEMA  DE PRONÓSTICO (V4)")
 print("="*50)
 
 try:
-    print("\nIntroduce los valores actuales del clima:")
-    pm10 = float(input(" -> PM10 [ug/m3]: "))
-    o3 = float(input(" -> Ozono [ppb]: "))
-    co = float(input(" -> CO [ppb]: "))
-    temp = float(input(" -> Temperatura [°C]: "))
-    hum = float(input(" -> Humedad [%]: "))
+    print("\n--- A. DATOS CLIMÁTICOS ACTUALES ---")
+    pm10 = float(input("PM10: "))
+    ozono = float(input("Ozono: "))
+    co = float(input("CO: "))
+    temp = float(input("Temp: "))
+    hum = float(input("Humedad: "))
     
-    # Proceso
-    input_data = np.array([[pm10, o3, co, temp, hum]])
-    input_norm = scaler_X.transform(input_data)
-    input_tensor = torch.tensor(input_norm, dtype=torch.float32)
+    print("\n--- B. HISTORIA RECIENTE ---")
+    pm10_ant = float(input("PM10 (Hace 1h): "))
+    pm25_act = float(input("PM2.5 (Actual): "))
+    pm25_ant1 = float(input("PM2.5 (Hace 1h): "))
+    pm25_ant2 = float(input("PM2.5 (Hace 2h): "))
     
-    model.eval()
+    prom_3h = (pm25_act + pm25_ant1 + pm25_ant2) / 3
+    cambio_pm25 = pm25_act - pm25_ant1
+    cambio_pm10 = pm10 - pm10_ant
+    
+    x_usr = np.array([[pm10, ozono, co, temp, hum, pm25_act, prom_3h, cambio_pm25, cambio_pm10]])
+    x_usr_norm = esc_X.transform(x_usr)
+    x_tensor = torch.tensor(x_usr_norm, dtype=torch.float32)
+    
+    modelo.eval()
     with torch.no_grad():
-        pred_norm = model(input_tensor)
+        res_final = esc_y.inverse_transform(modelo(x_tensor).numpy())[0][0]
     
-    pred_final = scaler_y.inverse_transform(pred_norm.numpy())[0][0]
-    pred_final = max(0, pred_final)
-    nivel = clasificar_riesgo(pred_final)
-    
-    print("\n" + "-"*30)
-    print("      RESULTADO DEL ANÁLISIS")
-    print("-" * 30)
-    print(f"ESTIMACIÓN PM2.5:   {pred_final:.2f} ug/m3")
-    print(f"NIVEL DE RIESGO:    {nivel}")
-    print("-" * 30)
+    print("\n" + "*"*35)
+    print(f" PRONÓSTICO (+1 HORA): {max(0, res_final):.2f} ug/m3")
+    print("*" * 35)
 
-except ValueError:
-    print("\nERROR: Debes introducir números válidos (ej: 25.5).")
 except Exception as e:
-    print(f"\nERROR INESPERADO: {e}")
+    print(f"Error: {e}")
