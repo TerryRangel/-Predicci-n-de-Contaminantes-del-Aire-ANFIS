@@ -1,103 +1,131 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.metrics import mean_squared_error, r2_score
 import numpy as np
+import torch
+import joblib
+from ANFIS import ANFIS
+from ModeloSimple import ANN_Simple
 
 # Configuración
-st.set_page_config(page_title="Monitor Calidad Aire - CDMX", layout="wide")
+st.set_page_config(page_title="Predicción Calidad Aire", layout="wide")
+st.markdown("<h1 style='text-align: center; color: #2E86C1;'>🌫️ Sistema Inteligente de Predicción PM2.5</h1>", unsafe_allow_html=True)
 
-st.markdown("""
-    <style>
-    .big-font {font-size:30px !important; font-weight: bold; color: #2E86C1;}
-    </style>
-    """, unsafe_allow_html=True)
+# PESTAÑAS
+tab1, tab2 = st.tabs(["📊 Análisis Comparativo (Test)", "🧪 Predicción en Vivo (Manual)"])
 
-st.markdown('<p class="big-font">🌫️ Sistema Inteligente de Predicción PM2.5</p>', unsafe_allow_html=True)
-st.markdown("Comparativa Técnica: **Neuro-Difuso Evolutivo (ANFIS-EA)** vs **Red Neuronal Clásica (ANN)**")
-
-# CARGA DE DATOS
-try:
-    df = pd.read_csv('resultados_test.csv')
-    df['Fecha'] = pd.to_datetime(df['Fecha'])
-except FileNotFoundError:
-    st.error("⚠️ Falta el archivo 'resultados_test.csv'. Ejecuta primero 'procesar_modelos.py'.")
-    st.stop()
-
-# INTERFAZ
-col_control, col_grafica = st.columns([1, 3])
-
-with col_control:
-    st.header("⚙️ Configuración")
-    cols_pred = [c for c in df.columns if c not in ['Fecha', 'Real']]
-    seleccion = st.multiselect("Seleccionar Modelos:", cols_pred, default=cols_pred)
-    
-    st.markdown("---")
-    st.subheader("📊 Métricas (Test Set)")
-    
-    if seleccion:
-        for modelo in seleccion:
-            rmse = np.sqrt(mean_squared_error(df['Real'], df[modelo]))
-            r2 = r2_score(df['Real'], df[modelo])
-            
-            st.markdown(f"**{modelo}**")
-            col1, col2 = st.columns(2)
-            col1.metric("RMSE", f"{rmse:.2f}")
-            col2.metric("R²", f"{r2:.4f}")
-            st.markdown("---")
-
-# GRÁFICA PRINCIPAL
-with col_grafica:
-    st.subheader("📈 Series de Tiempo: Predicción vs Realidad")
-    
-    fig = go.Figure()
-    
-    # Real
-    fig.add_trace(go.Scatter(
-        x=df['Fecha'], y=df['Real'], mode='lines', name='Sensor Real (Target)',
-        line=dict(color='black', width=2)
-    ))
-    
-    # Modelos
-    colores = {'ANFIS_EA (Propuesto)': '#2ECC71', 'ANN_Simple (Benchmark)': '#E74C3C'}
-    
-    for modelo in seleccion:
-        color = colores.get(modelo, 'blue')
-        fig.add_trace(go.Scatter(
-            x=df['Fecha'], y=df[modelo], mode='lines', name=modelo,
-            line=dict(color=color, width=2, dash='dot')
-        ))
-        
-    fig.update_layout(
-        height=500,
-        template="plotly_white",
-        hovermode="x unified",
-        xaxis_title="Tiempo",
-        yaxis_title="PM2.5 [ug/m3]",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-# SECCIÓN COMPARATIVA (Zoom y Errores)
-st.subheader("🔍 Análisis Detallado de Errores")
-tab1, tab2 = st.tabs(["📉 Distribución de Errores (Residuos)", "🔭 Zoom (Últimas 48 horas)"])
-
+# =========================================================
+# TAB 1: GRÁFICAS COMPARATIVAS (LEE EL CSV)
+# =========================================================
 with tab1:
-    fig_hist = go.Figure()
-    for modelo in seleccion:
-        residuo = df['Real'] - df[modelo]
-        fig_hist.add_trace(go.Histogram(
-            x=residuo, name=f'Error {modelo}', opacity=0.6
-        ))
-    fig_hist.update_layout(barmode='overlay', title="Histograma de Residuos (Cero es perfecto)")
-    st.plotly_chart(fig_hist, use_container_width=True)
+    try:
+        df = pd.read_csv('resultados_test.csv')
+        df['Fecha'] = pd.to_datetime(df['Fecha'])
+        
+        st.subheader("Rendimiento del Modelo en Test Set")
+        cols_modelos = [c for c in df.columns if c not in ['Fecha', 'Real']]
+        seleccion = st.multiselect("Comparar Modelos:", cols_modelos, default=cols_modelos)
+        
+        # Gráfica
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df['Fecha'], y=df['Real'], mode='lines', name='Real', line=dict(color='black')))
+        
+        for mod in seleccion:
+            fig.add_trace(go.Scatter(x=df['Fecha'], y=df[mod], mode='lines', name=mod, line=dict(dash='dot')))
+            
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Métricas
+        if seleccion:
+            cols = st.columns(len(seleccion))
+            for idx, mod in enumerate(seleccion):
+                rmse = np.sqrt(mean_squared_error(df['Real'], df[mod]))
+                r2 = r2_score(df['Real'], df[mod])
+                cols[idx].metric(label=f"RMSE {mod}", value=f"{rmse:.2f}", delta=f"R2: {r2:.3f}")
+                
+    except FileNotFoundError:
+        st.error("⚠️ Ejecuta primero 'procesar_modelos.py' para generar los datos.")
 
+# =========================================================
+# TAB 2: PREDICCIÓN MANUAL EN VIVO (USA LOS .PTH)
+# =========================================================
 with tab2:
-    # Filtramos las ultimas 48 datos para ver detalle
-    df_zoom = df.tail(48)
-    fig_zoom = go.Figure()
-    fig_zoom.add_trace(go.Scatter(x=df_zoom['Fecha'], y=df_zoom['Real'], mode='lines+markers', name='Real', line=dict(color='black')))
-    for modelo in seleccion:
-        fig_zoom.add_trace(go.Scatter(x=df_zoom['Fecha'], y=df_zoom[modelo], mode='lines', name=modelo))
-    fig_zoom.update_layout(title="Comportamiento en las últimas 48 horas registradas")
-    st.plotly_chart(fig_zoom, use_container_width=True)
+    st.subheader("Simulador de Predicción (t+1 hora)")
+    
+    # Verificar archivos necesarios
+    try:
+        scaler_X = joblib.load('scaler_X.pkl')
+        scaler_y = joblib.load('scaler_y.pkl')
+    except:
+        st.error("Faltan los escaladores (.pkl). Ejecuta 'procesar_modelos.py'.")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    
+    # Inputs del Usuario (Datos Físicos Reales)
+    with col1:
+        pm10 = st.number_input("PM10 Actual", value=45.0)
+        pm10_ant = st.number_input("PM10 (Hace 1h)", value=42.0)
+        temp = st.number_input("Temperatura (°C)", value=22.5)
+        
+    with col2:
+        ozono = st.number_input("Ozono (ppb)", value=30.0)
+        co = st.number_input("Monóxido Carbono (ppb)", value=350.0)
+        humedad = st.number_input("Humedad Relativa (%)", value=40.0)
+        
+    with col3:
+        pm25_act = st.number_input("PM2.5 Actual", value=25.0)
+        pm25_ant1 = st.number_input("PM2.5 (Hace 1h)", value=23.0)
+        pm25_ant2 = st.number_input("PM2.5 (Hace 2h)", value=20.0)
+
+    # Botón de Predicción
+    if st.button("🔮 Calcular Predicción Futura", type="primary"):
+        # 1. Calcular Variables Derivadas (Tu ingeniería de datos)
+        prom_3h = (pm25_act + pm25_ant1 + pm25_ant2) / 3
+        cambio_pm25 = pm25_act - pm25_ant1
+        cambio_pm10 = pm10 - pm10_ant
+        
+        # 2. Crear Vector de Entrada (Orden exacto del entrenamiento)
+        input_data = np.array([[
+            pm10, ozono, co, temp, humedad, 
+            pm25_act, prom_3h, cambio_pm25, cambio_pm10
+        ]])
+        
+        # 3. Normalizar
+        input_norm = scaler_X.transform(input_data)
+        input_tensor = torch.tensor(input_norm, dtype=torch.float32)
+        
+        # 4. Cargar Modelos y Predecir
+        resultados = {}
+        
+        # ANFIS
+        try:
+            modelo_anfis = ANFIS(n_entr=9, n_curvas=3, n_reglas=35)
+            modelo_anfis.load_state_dict(torch.load('modelo_anfis.pth'))
+            modelo_anfis.eval()
+            with torch.no_grad():
+                pred_anfis_norm = modelo_anfis(input_tensor).numpy()
+                pred_anfis = scaler_y.inverse_transform(pred_anfis_norm)[0][0]
+                resultados['ANFIS_EA'] = max(0, pred_anfis)
+        except:
+            resultados['ANFIS_EA'] = "Error cargando modelo"
+
+        # ANN SIMPLE
+        try:
+            modelo_ann = ANN_Simple(n_entr=9)
+            modelo_ann.load_state_dict(torch.load('modelo_ann.pth'))
+            modelo_ann.eval()
+            with torch.no_grad():
+                pred_ann_norm = modelo_ann(input_tensor).numpy()
+                pred_ann = scaler_y.inverse_transform(pred_ann_norm)[0][0]
+                resultados['ANN_Simple'] = max(0, pred_ann)
+        except:
+            resultados['ANN_Simple'] = "Error cargando modelo"
+            
+        # 5. Mostrar Resultados
+        st.markdown("---")
+        res_col1, res_col2 = st.columns(2)
+        
+        res_col1.success(f"### ANFIS Predice:\n# {resultados['ANFIS_EA']:.2f} ug/m3")
+        res_col2.warning(f"### ANN Simple Predice:\n# {resultados['ANN_Simple']:.2f} ug/m3")
