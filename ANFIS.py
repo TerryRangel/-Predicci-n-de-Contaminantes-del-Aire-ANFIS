@@ -40,7 +40,7 @@ class ANFIS(nn.Module):
                 self.sigmas[i] = torch.std(col) + 0.05
 
 # ==============================================================================
-# 2. BLOQUE DE EJECUCIÓN (SOLO SE EJECUTA SI CORRES ESTE ARCHIVO DIRECTAMENTE)
+# 2. BLOQUE DE EJECUCIÓN 
 # ==============================================================================
 if __name__ == "__main__":
     

@@ -4,10 +4,8 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-import joblib # Para guardar los escaladores
+import joblib
 import os
-
-# IMPORTAMOS TUS CLASES
 from ANFIS import ANFIS  
 from ModeloSimple import ANN_Simple 
 
@@ -72,7 +70,7 @@ def ejecutar_pipeline():
     crit = nn.MSELoss()
 
     modelo_anfis.train()
-    for e in range(500): # Sube las épocas si quieres
+    for e in range(3000): 
         opt_anfis.zero_grad()
         loss = crit(modelo_anfis(X_ent_t), y_ent_t)
         loss.backward()
@@ -91,7 +89,7 @@ def ejecutar_pipeline():
     opt_ann = torch.optim.SGD(modelo_ann.parameters(), lr=0.01, momentum=0.9)
     
     modelo_ann.train()
-    for e in range(500): # Sube las épocas si quieres
+    for e in range(2500): 
         opt_ann.zero_grad()
         loss = crit(modelo_ann(X_ent_t), y_ent_t)
         loss.backward()

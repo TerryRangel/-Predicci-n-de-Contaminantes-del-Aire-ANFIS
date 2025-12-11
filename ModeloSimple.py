@@ -26,7 +26,7 @@ class ANN_Simple(nn.Module):
         return self.red(x)
 
 # ==============================================================================
-# 2. BLOQUE DE EJECUCIÓN (TODO LO DE ABAJO DEBE ESTAR IDENTADO)
+# 2. BLOQUE DE EJECUCIÓN 
 # ==============================================================================
 if __name__ == "__main__":
     
